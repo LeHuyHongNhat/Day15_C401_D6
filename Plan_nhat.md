@@ -1,7 +1,7 @@
 # Vinmec AI Medical Scribe
 ## Kế hoạch Triển khai & Phân tích Production
 
-> **Phiên bản:** 1.0 | **Ngày:** Tháng 4, 2026 | **Mức độ:** Confidential — Dành cho Nhà đầu tư & Ban Lãnh đạo
+> **Phiên bản:** 1.1 | **Ngày:** Tháng 4, 2026 | **Mức độ:** Confidential — Dành cho Nhà đầu tư & Ban Lãnh đạo
 
 ---
 
@@ -110,6 +110,12 @@ SOAP Note → ICD-10 Codes → HIS/EMR → Bác sĩ xem xét & ký duyệt
 - Mọi thay đổi bệnh án phải có **audit trail đầy đủ** (ai sửa gì, lúc nào)
 - Không được dùng dữ liệu thật để train model của bên thứ ba
 
+**Biện pháp tuân thủ cụ thể:**
+- Audio tự động xóa sau **24 giờ** kể từ khi bệnh án được bác sĩ ký duyệt
+- PHI được mã hóa **AES-256** at rest và in transit
+- Audit log **bất biến (immutable)** lưu tối thiểu **10 năm** theo quy định
+- Consent workflow tích hợp ngay lúc kích hoạt — bệnh nhân ký số điện tử trước khi bắt đầu ghi âm
+
 #### Ràng buộc 2: HIS Integration & Approval Workflow
 - Phải tích hợp với HIS hiện tại qua chuẩn **HL7 FHIR v4**
 - Bác sĩ phải **review và ký điện tử** trước khi bệnh án được lưu chính thức
@@ -130,6 +136,8 @@ SOAP Note → ICD-10 Codes → HIS/EMR → Bác sĩ xem xét & ký duyệt
 | Dữ liệu có được rời khỏi tổ chức không? | **Không.** Phải xử lý trong hạ tầng nội bộ hoặc private cloud |
 | Cần tích hợp hệ thống cũ không? | **Có.** Tích hợp HIS qua HL7 FHIR, có approval workflow |
 | Nếu trả lời sai thì ai bị ảnh hưởng đầu tiên? | **Bệnh nhân** — sai chẩn đoán, sai thuốc, sai liều |
+| Bác sĩ có đồng ý bị ghi âm không? | **Có consent workflow** — bệnh nhân ký số trước khi bắt đầu |
+| Nếu AI sai, trách nhiệm pháp lý thuộc về ai? | **Bác sĩ vẫn phải review và ký duyệt** — AI chỉ là công cụ hỗ trợ |
 
 ---
 
@@ -435,7 +443,29 @@ Phase 3 (Tháng 10+): Semantic Caching cho common phrases
 
 ---
 
-### 6.2 Phân loại request: Real-time vs. Async
+### 6.2 ⭐ Fallback Decision Timeline (Bổ sung mới)
+
+Bác sĩ **luôn biết hệ thống đang ở trạng thái nào** qua màu banner. Workflow lâm sàng không bao giờ bị tắc — tệ nhất là quay về nhập tay như cũ, không tệ hơn hiện tại.
+
+```
+Fallback Decision Timeline:
+
+T+0s    Request gửi đi
+T+5s    Nếu chưa có response → hiển thị "Đang xử lý..."
+T+10s   Circuit breaker trigger → tự động switch Level 1
+T+13s   (<3s) Secondary provider tiếp nhận
+T+15s   🟡 Bác sĩ thấy banner vàng: "Đang dùng chế độ dự phòng"
+
+Nếu Level 1 cũng fail:
+T+25s   Switch Level 2 (template-based)
+T+30s   🟠 Bác sĩ thấy banner cam: "AI hạn chế — vui lòng bổ sung thêm"
+
+Nếu Level 2 cũng fail:
+T+40s   Switch Level 3 (manual)
+T+40s   🔴 Bác sĩ thấy banner đỏ: "AI tạm ngưng — nhập liệu thủ công"
+```
+
+### 6.3 Phân loại request: Real-time vs. Async
 
 | Request type | Xử lý | Lý do |
 |---|---|---|
@@ -445,7 +475,7 @@ Phase 3 (Tháng 10+): Semantic Caching cho common phrases
 | HIS write-back sau approve | **Async + confirmation** | Không cần real-time, cần đảm bảo thành công |
 | Audit log ghi nhận | **Async fire-and-forget** | Không ảnh hưởng UX |
 
-### 6.3 Metrics cần monitor
+### 6.4 Metrics cần monitor
 
 | Metric | Target | Alert threshold |
 |---|---|---|
@@ -456,25 +486,74 @@ Phase 3 (Tháng 10+): Semantic Caching cho common phrases
 | SOAP note accuracy (sampling) | > 85% | < 80% |
 | HIS write-back success rate | > 99.9% | < 99% |
 | System uptime (7h–20h) | > 99.9% | < 99.5% |
+| **Fallback detection time** | **< 10 giây** | **> 15 giây** |
+| **Provider switch time** | **< 3 giây** | **> 5 giây** |
+| **Bác sĩ nhận thông báo** | **< 1 giây sau switch** | **> 3 giây** |
 
-### 6.4 Fallback Proposal tổng thể
+### 6.5 Fallback Proposal tổng thể
 
 ```
 Level 1 — Degraded AI (model yếu hơn):
-  Dùng khi: Primary model timeout > 5 giây
-  Action: Route sang secondary LLM provider
-  UX impact: Chất lượng có thể thấp hơn 10–15%, thông báo cho bác sĩ
+  Dùng khi: Primary model timeout > 10 giây
+  Action: Route sang secondary LLM provider (tự động < 3 giây)
+  UX: Banner vàng — "Đang dùng chế độ dự phòng"
+  Chất lượng: Có thể thấp hơn 10–15%, thông báo cho bác sĩ
 
 Level 2 — Template-based (rule-based):
   Dùng khi: Tất cả LLM providers đều lỗi
   Action: Điền template SOAP với thông tin từ STT (keyword extraction)
-  UX impact: Bác sĩ phải điền nhiều hơn, nhưng không mất toàn bộ context
+  UX: Banner cam — "AI hạn chế — vui lòng bổ sung thêm"
+  Chất lượng: Bác sĩ phải điền nhiều hơn, nhưng không mất toàn bộ context
 
 Level 3 — Manual (tắt AI hoàn toàn):
   Dùng khi: STT lỗi hoặc audio quality quá kém
   Action: Chuyển sang HIS input thủ công như hiện tại
-  UX impact: Trở về trạng thái trước khi có AI — không tệ hơn hiện tại
+  UX: Banner đỏ — "AI tạm ngưng — nhập liệu thủ công"
+  Chất lượng: Trở về trạng thái trước khi có AI — không tệ hơn hiện tại
 ```
+
+---
+
+### 6.6 ⭐ STT Accuracy — Medical Safety Layer (Bổ sung mới)
+
+**Vấn đề với con số 92% word-level accuracy:**
+
+> 500 ca/ngày × 1.500 từ/ca = 750.000 từ/ngày → 8% lỗi = **~60.000 từ sai/ngày**. Nếu chỉ 0.1% rơi vào tên thuốc hay liều lượng = **60 lỗi lâm sàng nguy hiểm/ngày**.
+
+**Giải pháp: Phân tầng field theo mức độ rủi ro**
+
+```
+Transcript thô từ STT
+        ↓
+[Medical NER — Nhận diện thực thể y tế]
+        ↓
+Phân loại field theo mức độ rủi ro:
+
+🔴 CRITICAL (bắt buộc validate):    🟡 MEDIUM:             🟢 LOW:
+  - Tên thuốc                         - Triệu chứng          - Thông tin hành chính
+  - Liều lượng                        - Tiền sử bệnh         - Thời gian khám
+  - Đường dùng (uống/tiêm)           - Dị ứng               - Ghi chú thêm
+  - Chẩn đoán chính
+        ↓
+[Drug Database Validation]
+  So khớp với danh mục thuốc Vinmec
+  → Nếu match < 85% confidence: highlight đỏ, bắt bác sĩ confirm thủ công
+  → Nếu match ≥ 85%: hiển thị bình thường
+        ↓
+SOAP Note hiển thị cho bác sĩ
+  (field đỏ = cần xác nhận, field xanh = đã validate)
+```
+
+**Accuracy theo field sau Medical Safety Layer:**
+
+| Field type | STT accuracy hiện tại | Sau Medical Safety Layer |
+|---|---|---|
+| Tên thuốc thông thường | ~88% | ~99% (có validation) |
+| Liều lượng | ~85% | ~98% (có validation) |
+| Thuật ngữ chuyên khoa | ~79% | ~94% (có fine-tune) |
+| Thông tin thông thường | ~95% | ~95% |
+
+> **Nguyên tắc thiết kế:** Chúng tôi không chỉ tối ưu accuracy tổng thể — chúng tôi ưu tiên accuracy cho đúng những field có thể gây hại cho bệnh nhân.
 
 ---
 
@@ -534,22 +613,74 @@ Level 3 — Manual (tắt AI hoàn toàn):
 | **Chi phí MVP** | ~$6.000/tháng cho 500 ca/ngày |
 | **Chi phí/ca** | $0.40 (MVP) → $0.20 (scale 10x) |
 | **ROI ước tính** | Break-even trong 6–9 tháng |
-| **Tiết kiệm** | 25–40% thời gian nhập liệu/bác sĩ → $X,XXX/bác sĩ/năm |
+| **Tiết kiệm** | 25–40% thời gian nhập liệu/bác sĩ |
 | **Rủi ro lớn nhất** | STT accuracy tiếng Việt y tế + compliance pháp lý |
 
-### 8.2 ROI Analysis cho Nhà đầu tư
+### 8.2 ⭐ ROI Analysis — 3 góc nhìn (Bổ sung mới)
 
-**Giả định tính ROI:**
-- 50 bác sĩ × 20 ca/ngày × 8 phút tiết kiệm/ca = 8.000 phút/ngày = 133 giờ/ngày
-- Giá trị thời gian bác sĩ: ~$30–50/giờ (tại Vinmec international)
-- Giá trị tiết kiệm: ~$4.000–6.700/ngày → **~$100.000–$200.000/năm chỉ từ 50 bác sĩ**
-- Chi phí hệ thống: ~$72.000/năm (MVP)
-- **ROI Year 1:** ~40–180% tùy assumption
+> **Lưu ý quan trọng:** "Tiết kiệm thời gian" không tự động thành tiền — bác sĩ không được trả thêm vì khám nhanh hơn. ROI thực sự đến từ 3 góc sau:
 
-**Tại scale 5 bệnh viện (250 bác sĩ):**
-- Tiết kiệm: ~$500.000–$1.000.000/năm
-- Chi phí hệ thống: ~$200.000/năm
-- **ROI: 150–400%**
+---
+
+**Góc 1: Doanh thu tăng thêm (thuyết phục nhất)**
+
+```
+Hiện tại:
+  Bác sĩ khám 15–18 ca/ngày (bị giới hạn bởi thời gian nhập liệu)
+
+Với AI Scribe:
+  Tiết kiệm 8 phút/ca → khám thêm được 1–2 ca/ngày/bác sĩ
+
+Tính toán:
+  50 bác sĩ × 1 ca thêm/ngày × $50 doanh thu/ca
+  = $2.500/ngày
+  = ~$75.000/tháng
+  = ~$900.000/năm
+
+Chi phí hệ thống MVP: ~$72.000/năm
+ROI năm 1: ~1.150%
+```
+
+---
+
+**Góc 2: Giảm rủi ro pháp lý**
+
+```
+Bệnh án sai do nhập liệu thủ công (mệt mỏi, vội vàng):
+  → 1 vụ kiện y tế tại VN: $50.000–$500.000 chi phí pháp lý + bồi thường
+  → Chưa kể mất uy tín thương hiệu Vinmec International
+
+AI Scribe giảm lỗi nhập liệu ước tính 60–70%
+  → Giá trị phòng ngừa rủi ro: hàng trăm nghìn đô/năm
+  → Đây là "insurance value" — khó định lượng nhưng rất thực
+```
+
+---
+
+**Góc 3: Tối ưu bảo hiểm claim**
+
+```
+Bệnh án đầy đủ, chuẩn ICD-10:
+  → Tỷ lệ claim bảo hiểm được chấp thuận cao hơn
+  → Giảm thời gian dispute với công ty bảo hiểm
+  → Vinmec thu tiền nhanh hơn
+
+Ước tính: Tăng claim approval rate 5%
+  → Doanh thu bảo hiểm ~$10M/năm → thêm $500.000/năm
+```
+
+---
+
+**Bảng ROI tổng hợp:**
+
+| Nguồn giá trị | Ước tính/năm | Độ chắc chắn |
+|---|---|---|
+| Doanh thu từ ca khám tăng thêm | ~$900.000 | Cao |
+| Giảm rủi ro pháp lý | ~$100.000–$500.000 | Trung bình |
+| Tối ưu bảo hiểm claim | ~$200.000–$500.000 | Trung bình |
+| **Tổng giá trị tạo ra** | **~$1.2M–$1.9M/năm** | |
+| **Chi phí hệ thống** | **~$72.000/năm** | Cao |
+| **ROI thực tế** | **~1.600–2.500%** | |
 
 ### 8.3 Next Steps — 90 ngày đầu tiên
 
